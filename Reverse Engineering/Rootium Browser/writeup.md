@@ -1,79 +1,77 @@
-# RootAccess CLI - CTF Solution
+# RootAccess CLI - CTF Writeup
 
 **Category:** Reverse Engineering / Node.js  
 **Challenge:** RootAccess CLI (NPM Package)  
-**Method:** Runtime Module Hijacking
+**Method:** Runtime Introspection / Module Abuse
 
-## Challenge Description
-The challenge provides a published NPM package (`root-access`) containing a heavily obfuscated CLI tool. The tool simulates a hacking interface with multiple "security layers" (passwords, time-based checks, key generation). The source code uses `javascript-obfuscator` with RC4 string encryption and control flow flattening, making static analysis extremely tedious.
+## Approach
+The target is a published NPM package (`root-access`) with a heavily obfuscated CLI. The flag is split into 10 XOR-encrypted fragments inside the package modules. Instead of reversing RC4-encoded strings and flattened control flow, I loaded the modules directly in Node.js and called the exported methods to extract and recombine the flag.
 
-The flag is split into 10 fragments hidden across the package's JavaScript modules.
+## Step 1: Initial Analysis
+- Installed the package globally: `npm install -g root-access`
+- Located the source: `npm root -g` → `node_modules/root-access/dist/lib/`
+- `package.json` shows `javascript-obfuscator` with RC4 string encoding, control flow flattening, dead-code injection, and unicode escapes
+- Obfuscated modules present: `index.js`, `crypto.js`, `keyforge.js`, `network.js`, `vault.js`
+- Key insight: every module uses `module.exports` to expose classes, so `require()` works without deobfuscation
 
-## Solution Strategy: "Library Abuse"
-Instead of manually reversing the obfuscated logic or solving the 10 layers of CLI puzzles, I attacked the architecture of the application itself.
+## Step 2: Core Technique
+I used dynamic analysis instead of static reversing:
+- Load each module in Node.js
+- Enumerate class methods with `Object.getOwnPropertyNames()`
 
-Since the tool is written in JavaScript and runs on Node.js, it must export its internal modules to function. By inspecting the file structure in `node_modules`, I identified the core logic files. The strategy was to import the obfuscated code as a library and force it to decrypt the flag.
+This works because the obfuscation makes the source painful to read, but the runtime still exposes clean class interfaces. That means we can call the interesting methods directly.
 
-### 1. Reconnaissance
-I navigated to the package installation directory:
+Key findings:
+- `CryptoEngine.getFragment(n)` returns fragment `n`
+- `CryptoEngine.__getFullFlag__()` returns the full flag in one shot
+- `DataVault.assembleFlag()` rebuilds the flag and reports a SHA256 hash
 
-```bash
-# Locate the package source
-cd node_modules/root-access/dist/lib/
-ls -la
-```
-
-I found `crypto.js`, which handles the encryption logic. Loading this module in a Node.js REPL revealed it exports a class named `CryptoEngine`.
-
-### 2. The Exploit
-Rather than solving the challenges intended for the user, I wrote a script to:
-
-- Bypass the CLI entry point (`bin/rootaccess`).
-- Directly `require()` the internal `crypto.js` module.
-- Instantiate the `CryptoEngine` class.
-- Call the internal methods to dump the decrypted flag.
-
-During inspection, I found a static method `__getFullFlag__()` which appeared to return the combined flag string.
-
-### 3. Exploit Code (`exploit.js`)
+## Step 3: Implementation
 ```js
-const path = require('path');
+const cryptoMod = require('root-access/dist/lib/crypto.js');
+const CE = cryptoMod.CryptoEngine;
 
-// Target the internal library file directly
-// Adjust the path based on your local install location
-// Usually: ./node_modules/root-access/dist/lib/crypto.js
-const LIB_PATH = require.resolve('root-access/dist/lib/crypto.js');
+// Enumerate methods
+console.log(Object.getOwnPropertyNames(CE));
 
-console.log("[*] Hijacking internal CryptoEngine...");
-
-try {
-  // 1. Load the obfuscated module
-  const targetModule = require(LIB_PATH);
-  const Engine = targetModule.CryptoEngine;
-
-  // 2. Inspect available methods (Recon)
-  console.log("[+] Module loaded. Methods detected:", Object.getOwnPropertyNames(Engine));
-
-  // 3. Trigger the hidden assembly function
-  // This bypasses the need for the Master Key or individual fragment collection
-  console.log("[*] Executing internal decryption routine...");
-
-  // The engine decrypts itself when we call this
-  const secret = Engine.__getFullFlag__();
-
-  console.log("\\n[SUCCESS] Flag recovered:");
-  console.log(secret);
-} catch (err) {
-  console.error("[-] Exploit failed:", err.message);
+// Extract all fragments
+for (let i = 1; i <= CE.getTotalFragments(); i++) {
+  console.log(`Fragment ${i}: ${CE.getFragment(i)}`);
 }
+
+// Or get the full flag directly
+console.log(CE.__getFullFlag__());
 ```
+
+At runtime, each fragment is decoded by:
+1. Base64 decode
+2. XOR with the key `SHADOWGATE`
+
+## Step 4: Extraction
+Fragments returned by `CryptoEngine.getFragment(i)`:
+
+| Fragment | Value |
+| --- | --- |
+| 1 | `root` |
+| 2 | `{n0_` |
+| 3 | `m0r3` |
+| 4 | `_34s` |
+| 5 | `y_v4` |
+| 6 | `ult_` |
+| 7 | `3xtr` |
+| 8 | `4ct1` |
+| 9 | `0n_9` |
+| 10 | `9}` |
+
+Concatenating yields the flag. I also verified with `DataVault.assembleFlag()`, which prints the SHA256 hash:
+`c8cda0cca11a25de0c8644e9c6e7d1004187514062a374e222dc5b144261dda4`
 
 ## Flag
-Running the exploit script instantly returned the assembled flag:
-
 ```text
-root{N0d3_Cl1_R3v3rs3_3ng1n33r1ng_M4st3r_0f_Sh4d0ws}
+root{n0_m0r3_34sy_v4ult_3xtr4ct10n_99}
 ```
 
-## Why This Works
-The obfuscation protected the source code from being read by humans, but it did not protect the runtime objects from being accessed by other code. By using `require()`, we operate inside the trusted memory space of the application, allowing us to call functions that were intended to be private or internal.
+## Tools Used
+- Node.js: runtime execution and method calls
+- npm: package install and source discovery
+- `Object.getOwnPropertyNames()`: API discovery on obfuscated classes
